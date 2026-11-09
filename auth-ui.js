@@ -5,6 +5,7 @@
   const config = root.LiveStatConfig || { apiBase: '', hosted: false };
   const hosted = config.hosted === true;
   const tokenKey = 'livestat-session-token';
+  const serviceUnavailable = 'The hosted data service is unavailable. Please try again shortly.';
   let token = '';
   let epoch = 0;
   let authAttempt = 0;
@@ -137,9 +138,16 @@
     let delay = 0;
     try {
       if (configurationError) throw new Error(configurationError);
-      const response = await rawFetch(owner ? '/api/auth/owner-login' : '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(owner ? { ownerKey: credential } : { passcode: credential }) });
+      let response;
+      try {
+        response = await rawFetch(owner ? '/api/auth/owner-login' : '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(owner ? { ownerKey: credential } : { passcode: credential }) });
+      } catch (_) { throw new Error(serviceUnavailable); }
       let result = {};
-      try { result = await response.json(); } catch (_) { /* Use a safe generic error. */ }
+      let validJson = false;
+      try {
+        const value = await response.json();
+        if (value && typeof value === 'object' && !Array.isArray(value)) { result = value; validJson = true; }
+      } catch (_) { /* A tunnel/gateway page is not a credential rejection. */ }
       if (attempt !== authAttempt) {
         // A superseded same-origin login may still have set an HttpOnly cookie.
         // Revoke its distinct session without changing the current view/token.
@@ -149,7 +157,9 @@
         return;
       }
       if (response.status === 429) { delay = retrySeconds(response); throw new Error(`Too many attempts. Try again in ${delay} seconds.`); }
-      if (!response.ok || !accept(result)) throw new Error(text(result.error) || text(result.message) || 'That credential was not accepted. Please try again.');
+      if (!validJson || response.status >= 500 || (!response.ok && ![400, 401, 403].includes(response.status))) throw new Error(serviceUnavailable);
+      if (!response.ok) throw new Error(text(result.error) || text(result.message) || 'That credential was not accepted. Please try again.');
+      if (!accept(result)) throw new Error(serviceUnavailable);
       message('');
     } catch (error) { if (attempt === authAttempt) message(error.message || 'Sign-in could not finish. Please try again.'); }
     finally {
@@ -201,9 +211,15 @@
     const probeAttempt = authAttempt;
     try {
       const response = await rawFetch('/api/auth/session');
-      const result = response.ok ? await response.json() : {};
+      if (!response.ok) throw new Error(serviceUnavailable);
+      const result = await response.json();
+      if (!result || typeof result !== 'object' || Array.isArray(result) || typeof result.authenticated !== 'boolean' || (result.authenticated && !['owner', 'viewer'].includes(result.role))) throw new Error(serviceUnavailable);
       if (probeEpoch !== epoch || probeAttempt !== authAttempt) return;
       if (!accept(result)) signedOut();
-    } catch (_) { if (probeEpoch === epoch && probeAttempt === authAttempt) signedOut('The hosted data service is unavailable. Please try signing in again shortly.'); }
+    } catch (_) {
+      // An outage is not proof that a cached token was rejected. Stay locked,
+      // retaining it for a later valid session check rather than granting access.
+      if (probeEpoch === epoch && probeAttempt === authAttempt) message(serviceUnavailable);
+    }
   })();
 })(window);
